@@ -38,10 +38,10 @@ class PDFToExcelConverter:
     
     def extract_tables_with_pdfplumber(self) -> List[pd.DataFrame]:
         """
-        Extract tables using pdfplumber library.
+        Extract tables using pdfplumber library with page and table headers.
         
         Returns:
-            List[pd.DataFrame]: List of extracted tables as DataFrames
+            List[pd.DataFrame]: List of extracted tables as DataFrames with header column
         """
         tables = []
         logger.info("Extracting tables using pdfplumber...")
@@ -51,17 +51,29 @@ class PDFToExcelConverter:
                 for page_num, page in enumerate(pdf.pages, 1):
                     logger.info(f"Processing page {page_num}/{len(pdf.pages)}")
                     
+                    # Extract full page text to find headers
+                    page_text = page.extract_text() or ""
+                    page_header = self._extract_page_header(page_text, page_num)
+                    
                     # Extract tables from the page
                     page_tables = page.extract_tables()
                     
                     for table_num, table in enumerate(page_tables, 1):
                         if table and len(table) > 1:  # Ensure table has data
                             try:
+                                # Find table header by looking at text before table position
+                                table_header = self._extract_table_header(page, table, page_text, table_num)
+                                
+                                # Combine page header and table header
+                                combined_header = self._combine_headers(page_header, table_header)
+                                
                                 # Convert to DataFrame
                                 df = pd.DataFrame(table[1:], columns=table[0])
                                 df = self._clean_dataframe(df)
                                 
                                 if not df.empty:
+                                    # Add header as first column
+                                    df = self._add_header_column(df, combined_header)
                                     df.name = f"Page_{page_num}_Table_{table_num}"
                                     tables.append(df)
                                     logger.info(f"Extracted table from page {page_num}, table {table_num}: {df.shape}")
@@ -75,6 +87,8 @@ class PDFToExcelConverter:
                             try:
                                 df = self._extract_table_from_text(text, page_num)
                                 if df is not None and not df.empty:
+                                    # Add page header to text tables too
+                                    df = self._add_header_column(df, page_header)
                                     df.name = f"Page_{page_num}_Text_Table"
                                     tables.append(df)
                                     logger.info(f"Extracted text table from page {page_num}: {df.shape}")
@@ -88,10 +102,10 @@ class PDFToExcelConverter:
     
     def extract_tables_with_tabula(self) -> List[pd.DataFrame]:
         """
-        Extract tables using tabula-py library.
+        Extract tables using tabula-py library with basic headers.
         
         Returns:
-            List[pd.DataFrame]: List of extracted tables as DataFrames
+            List[pd.DataFrame]: List of extracted tables as DataFrames with header column
         """
         tables = []
         logger.info("Extracting tables using tabula-py...")
@@ -104,6 +118,9 @@ class PDFToExcelConverter:
                 if not df.empty:
                     df = self._clean_dataframe(df)
                     if not df.empty:
+                        # Add a generic header for tabula tables
+                        header_text = f"Tabula Table {i}"
+                        df = self._add_header_column(df, header_text)
                         df.name = f"Tabula_Table_{i}"
                         tables.append(df)
                         logger.info(f"Extracted table {i} with tabula: {df.shape}")
@@ -112,6 +129,153 @@ class PDFToExcelConverter:
             logger.error(f"Error extracting tables with tabula: {e}")
         
         return tables
+    
+    def _extract_page_header(self, page_text: str, page_num: int) -> str:
+        """
+        Extract page header from the top of the page text.
+        
+        Args:
+            page_text (str): Full page text
+            page_num (int): Page number
+            
+        Returns:
+            str: Extracted page header
+        """
+        if not page_text:
+            return f"Page {page_num}"
+        
+        lines = page_text.split('\n')
+        lines = [line.strip() for line in lines if line.strip()]
+        
+        if not lines:
+            return f"Page {page_num}"
+        
+        # Look for header patterns in the first few lines
+        header_candidates = []
+        
+        # Check first 5 lines for potential headers
+        for i, line in enumerate(lines[:5]):
+            # Skip very short lines or lines that look like page numbers
+            if len(line) < 3 or line.isdigit():
+                continue
+            
+            # Look for header indicators
+            if (line.isupper() or  # All caps
+                any(word in line.lower() for word in ['chapter', 'section', 'part', 'appendix']) or
+                line.startswith(('SECTION', 'CHAPTER', 'PART', 'APPENDIX')) or
+                len(line.split()) <= 6):  # Short descriptive lines
+                header_candidates.append(line)
+        
+        # Return the first good header candidate or first line
+        if header_candidates:
+            return header_candidates[0]
+        elif lines:
+            return lines[0]
+        else:
+            return f"Page {page_num}"
+    
+    def _extract_table_header(self, page, table_data, page_text: str, table_num: int) -> str:
+        """
+        Extract table header by looking at text immediately before the table.
+        
+        Args:
+            page: pdfplumber page object
+            table_data: Raw table data
+            page_text (str): Full page text
+            table_num (int): Table number on page
+            
+        Returns:
+            str: Extracted table header
+        """
+        try:
+            # Get table position if possible
+            table_objects = page.find_tables()
+            if table_objects and len(table_objects) >= table_num:
+                table_obj = table_objects[table_num - 1]
+                table_bbox = table_obj.bbox
+                table_top = table_bbox[1]
+                
+                # Extract text above the table
+                text_above = page.within_bbox((0, table_top - 100, page.width, table_top)).extract_text()
+                
+                if text_above:
+                    lines = text_above.split('\n')
+                    lines = [line.strip() for line in lines if line.strip()]
+                    
+                    # Look for the line immediately before the table
+                    for line in reversed(lines[-3:]):  # Check last 3 lines
+                        if (len(line) > 3 and 
+                            not line.isdigit() and 
+                            not all(c in '.-_=' for c in line.replace(' ', ''))):
+                            return line
+        except Exception:
+            pass
+        
+        # Fallback: look for patterns in page text
+        lines = page_text.split('\n')
+        lines = [line.strip() for line in lines if line.strip()]
+        
+        # Look for lines that might be table headers
+        for i, line in enumerate(lines):
+            if (len(line) > 5 and 
+                len(line) < 100 and
+                any(word in line.lower() for word in ['table', 'list', 'schedule', 'summary', 'data', 'report'])):
+                return line
+        
+        return f"Table {table_num}"
+    
+    def _combine_headers(self, page_header: str, table_header: str) -> str:
+        """
+        Combine page header and table header into a single header string.
+        
+        Args:
+            page_header (str): Page header text
+            table_header (str): Table header text
+            
+        Returns:
+            str: Combined header
+        """
+        # Clean headers
+        page_header = page_header.strip()
+        table_header = table_header.strip()
+        
+        # If table header is generic or very similar to page header, use just page header
+        if (table_header.lower().startswith('table') or 
+            table_header.lower() in page_header.lower() or
+            page_header.lower() in table_header.lower()):
+            return page_header
+        
+        # Combine both headers
+        if page_header and table_header:
+            return f"{page_header} - {table_header}"
+        elif page_header:
+            return page_header
+        elif table_header:
+            return table_header
+        else:
+            return "Data"
+    
+    def _add_header_column(self, df: pd.DataFrame, header_text: str) -> pd.DataFrame:
+        """
+        Add header text as the first column of the DataFrame.
+        
+        Args:
+            df (pd.DataFrame): Original DataFrame
+            header_text (str): Header text to add
+            
+        Returns:
+            pd.DataFrame: DataFrame with header column added
+        """
+        if df.empty:
+            return df
+        
+        # Create a copy to avoid modifying the original
+        new_df = df.copy()
+        
+        # Insert header column at the beginning
+        new_df.insert(0, 'Header', header_text)
+        
+        return new_df
     
     def _clean_dataframe(self, df: pd.DataFrame) -> pd.DataFrame:
         """
@@ -133,12 +297,17 @@ class PDFToExcelConverter:
         for col in df.columns:
             try:
                 if df[col].dtype == 'object':
-                    df[col] = df[col].astype(str).str.strip()
-                    df[col] = df[col].replace('nan', '')
+                    # Convert to string and strip whitespace
+                    df.loc[:, col] = df[col].astype(str).str.strip()
+                    df.loc[:, col] = df[col].replace('nan', '')
             except Exception:
                 # Handle cases where dtype check might fail
-                df[col] = df[col].astype(str).str.strip()
-                df[col] = df[col].replace('nan', '')
+                try:
+                    df.loc[:, col] = df[col].astype(str).str.strip()
+                    df.loc[:, col] = df[col].replace('nan', '')
+                except:
+                    # Last resort - skip this column
+                    pass
         
         return df
     
@@ -304,50 +473,47 @@ class PDFToExcelConverter:
     
     def _save_to_single_sheet(self, tables: List[pd.DataFrame]) -> None:
         """
-        Save all tables to a single Excel sheet with separators.
+        Save all tables to a single Excel sheet without any empty rows for better auto-filtering.
         
         Args:
             tables (List[pd.DataFrame]): List of tables to save
         """
         combined_rows = []
         
+        # First, collect all data rows without separators
         for i, df in enumerate(tables):
-            table_name = getattr(df, 'name', f'Table_{i+1}')
-            
-            # Add table header
-            combined_rows.append([f"=== {table_name} ==="])
-            
-            # Add the table data
             if not df.empty:
-                # Add column headers
-                combined_rows.append(list(df.columns))
-                
-                # Add data rows
+                # Add data rows only (no headers, no separators)
                 for _, row in df.iterrows():
-                    combined_rows.append(list(row))
-            
-            # Add empty separator row (except after last table)
-            if i < len(tables) - 1:
-                combined_rows.append([""])
+                    # Skip completely empty rows
+                    row_values = list(row)
+                    if any(pd.notna(val) and str(val).strip() != '' for val in row_values):
+                        combined_rows.append(row_values)
         
         # Create DataFrame from all rows
         if combined_rows:
             # Find the maximum number of columns needed
-            max_cols = max(len(row) for row in combined_rows)
+            max_cols = max(len(row) for row in combined_rows) if combined_rows else 0
             
             # Pad all rows to have the same number of columns
             for row in combined_rows:
                 while len(row) < max_cols:
                     row.append('')
             
-            # Create column names
-            columns = [f'Column_{i+1}' for i in range(max_cols)]
+            # Create column names - first column is Header, then data columns
+            columns = ['Header'] + [f'Column_{i+1}' for i in range(max_cols-1)] if max_cols > 1 else ['Header']
             
             final_df = pd.DataFrame(combined_rows, columns=columns)
+            
+            # Remove any remaining completely empty rows
+            final_df = final_df.dropna(how='all')
+            final_df = final_df[~final_df.apply(lambda row: all(pd.isna(val) or str(val).strip() == '' for val in row), axis=1)]
             
             with pd.ExcelWriter(self.output_path, engine='openpyxl') as writer:
                 final_df.to_excel(writer, sheet_name='All_Tables', index=False)
                 logger.info(f"Saved all {len(tables)} tables to single sheet: All_Tables")
+        else:
+            logger.warning("No data to save to Excel")
     
     def _save_to_multiple_sheets(self, tables: List[pd.DataFrame]) -> None:
         """
@@ -407,13 +573,13 @@ def main():
         sys.exit(1)
 
 if __name__ == "__main__":
-    # If no command line arguments, convert the ProZ-FP.pdf file in single sheet mode
+    # If no command line arguments, convert the ProV-TNE-FP.pdf file in single sheet mode
     if len(sys.argv) == 1:
-        print("Converting ProZ-FP.pdf to Excel (single sheet mode)...")
+        print("Converting ProV-TNE-FP.pdf to Excel (single sheet mode)...")
         print("This will extract all tables and combine them into one Excel sheet.")
         
         try:
-            converter = PDFToExcelConverter("ProZ-FP.pdf")
+            converter = PDFToExcelConverter("ProV-TNE-FP.pdf")
             converter.convert()
                 
         except Exception as e:
